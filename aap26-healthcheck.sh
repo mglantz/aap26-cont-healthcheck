@@ -11,7 +11,7 @@
 # unless your install genuinely runs rootful).
 #
 # Usage:
-#   ./aap26-healthcheck.sh --nodetype <controller|gateway|hub|execution|all> --api-host https://your-aap.example.com --tokenfile ./tokenfile
+#   ./aap26-healthcheck.sh --nodetype <controller|gateway|hub|execution|all> [options]
 #
 # Options:
 #   --nodetype TYPE     Role of this node (required). One of:
@@ -21,7 +21,6 @@
 #                         execution   - Execution node (Receptor only)
 #                         all         - All-in-one / single-node deployment
 #   --api-host HOST     Base host for API probes (default: https://localhost)
-#   --token-file FILE   Read the bearer token from FILE (first line).
 #   --log-lines N       Lines of container log to scan for errors (default: 200)
 #   --verbose, -v       Show extra detail (full container list, log excerpts)
 #   --no-color          Disable colored output
@@ -177,6 +176,54 @@ http_code() {
   curl -sk -o /dev/null -m 10 "${AUTH_ARGS[@]}" -w '%{http_code}' "$1" 2>/dev/null
 }
 
+# ----------------------------- prerequisites -------------------------------
+# Validate the RPMs the health check depends on are installed BEFORE running
+# any checks. 'ss' (iproute), curl, and podman are all required. Aborts early
+# if any are missing rather than producing a cascade of broken checks.
+check_prerequisites() {
+  section "Prerequisites"
+
+  # Non-RPM host (or rpm not on PATH): fall back to verifying the commands.
+  if ! have rpm; then
+    warn "rpm unavailable — verifying required commands directly instead of RPMs"
+    local missing=0 cmd
+    for cmd in ss curl podman; do
+      if have "${cmd}"; then pass "Command present: ${cmd}"
+      else fail "Required command missing: ${cmd}"; missing=$((missing+1)); fi
+    done
+    if [[ "${missing}" -gt 0 ]]; then
+      printf '\n  %sAborting: required tooling is missing.%s\n' "${C_RED}${C_BOLD}" "${C_RST}"
+      summary; exit 1
+    fi
+    return
+  fi
+
+  local missing=0
+
+  # 'ss' is shipped by 'iproute' on RHEL; some distros package it as 'iproute2'.
+  if rpm -q iproute >/dev/null 2>&1; then
+    pass "RPM installed: $(rpm -q iproute 2>/dev/null | head -n1) (provides ss)"
+  elif rpm -q iproute2 >/dev/null 2>&1; then
+    pass "RPM installed: $(rpm -q iproute2 2>/dev/null | head -n1) (provides ss)"
+  else
+    fail "Required RPM not installed: iproute (provides 'ss')"; missing=$((missing+1))
+  fi
+
+  local pkg
+  for pkg in curl podman; do
+    if rpm -q "${pkg}" >/dev/null 2>&1; then
+      pass "RPM installed: $(rpm -q "${pkg}" 2>/dev/null | head -n1)"
+    else
+      fail "Required RPM not installed: ${pkg}"; missing=$((missing+1))
+    fi
+  done
+
+  if [[ "${missing}" -gt 0 ]]; then
+    printf '\n  %sAborting: install the missing RPM(s) before running.%s\n' "${C_RED}${C_BOLD}" "${C_RST}"
+    summary; exit 1
+  fi
+}
+
 # ----------------------------- preflight -----------------------------------
 preflight() {
   section "Preflight"
@@ -321,8 +368,58 @@ scan_selinux_denials() {
   fi
 }
 
+# ----------------------------- hostname / FQDN -----------------------------
+# Every AAP node (controller, gateway, hub, eda, execution) must have a fully
+# qualified domain name as its hostname, resolvable across the cluster. The
+# script runs per node; this validates the local machine's hostname.
+check_hostname() {
+  section "Hostname (FQDN)"
+
+  local static fqdn hn
+  static="$(hostnamectl --static 2>/dev/null)"
+  [[ -z "${static}" ]] && static="$(hostname 2>/dev/null)"
+  fqdn="$(hostname -f 2>/dev/null)"
+  hn="${static}"
+
+  if [[ -z "${hn}" ]]; then
+    fail "Could not determine the system hostname"
+    return
+  fi
+
+  local is_fqdn=0
+  if [[ "${hn}" =~ ^[0-9.]+$ || "${hn}" == *:* ]]; then
+    fail "Hostname '${hn}' is an IP address — AAP requires an FQDN"
+  elif [[ "${hn}" != *.* || "${hn}" == localhost* ]]; then
+    fail "Hostname '${hn}' is not fully qualified — AAP requires an FQDN (e.g. host.example.com)"
+  else
+    pass "System hostname is an FQDN: ${hn}"
+    is_fqdn=1
+  fi
+
+  # 'hostname -f' should independently resolve to an FQDN — catches /etc/hosts
+  # or DNS gaps even when the static name looks correct.
+  if [[ -z "${fqdn}" ]]; then
+    warn "'hostname -f' returned nothing — FQDN cannot be resolved (check /etc/hosts and DNS)"
+  elif [[ "${fqdn}" != *.* || "${fqdn}" == localhost* ]]; then
+    warn "'hostname -f' is not an FQDN ('${fqdn}') — check /etc/hosts and DNS"
+  else
+    [[ "${fqdn}" != "${hn}" ]] && detail "static='${hn}', hostname -f='${fqdn}'"
+  fi
+
+  # Forward resolution (best-effort), only meaningful once it's a valid FQDN.
+  if have getent && [[ "${is_fqdn}" -eq 1 ]]; then
+    if getent hosts "${hn}" >/dev/null 2>&1; then
+      pass "Hostname '${hn}' resolves"
+    else
+      warn "Hostname '${hn}' does not resolve via getent — AAP nodes must be resolvable across the cluster"
+    fi
+  fi
+}
+
 # ----------------------------- common checks -------------------------------
 common_checks() {
+  check_hostname
+
   section "System resources"
 
   # Memory
@@ -828,6 +925,7 @@ summary() {
 printf '%sAAP 2.6 Containerized Health Check%s\n' "${C_BOLD}" "${C_RST}"
 printf 'Node type: %s   Host: %s   %s\n' "${NODETYPE}" "$(hostname -f 2>/dev/null || hostname)" "$(date '+%Y-%m-%d %H:%M:%S %Z')"
 
+check_prerequisites
 preflight
 common_checks
 check_ports
