@@ -120,6 +120,11 @@ FAIL.
   name (FAIL on a short name, IP address, or `localhost*`), with best-effort
   checks that `hostname -f` and forward resolution agree. AAP requires every
   node to have a resolvable FQDN; run the script on each node to cover them all.
+- **Time synchronization** — clock skew silently breaks TLS validation, OAuth
+  tokens, and the receptor mesh, so a node that isn't NTP-synced is flagged
+  (via `timedatectl`/`chronyc`).
+- **User namespace mappings** — verifies the install user has `/etc/subuid` and
+  `/etc/subgid` ranges; without them rootless containers and EEs can't start.
 - **System resources** — available memory, load average, and disk usage on `/`,
   `/var`, `$HOME`, and the Podman graphroot.
 - **SELinux** — runtime mode (Enforcing = PASS, Permissive = WARN,
@@ -138,16 +143,33 @@ FAIL.
 
 ### Role-specific checks
 
+In addition to the per-role container/API checks, each node validates its TLS
+certificate expiry (WARN within 30 days, FAIL if expired — important because the
+API probes use `-k`) and that its database migrations are fully applied (a
+silent post-upgrade breakage). Specifically:
+
 - **gateway** — gateway and Envoy/proxy containers; gateway API and login page
   reachability; an explicit scan for Fernet `InvalidToken` (the secret-key
-  mismatch failure mode); Redis; PostgreSQL.
+  mismatch failure mode); **routing checks that probe the controller, hub, and
+  EDA backends *through* the gateway** (confirming it actually proxies); Redis;
+  PostgreSQL.
 - **controller** — web/task containers; `/api/controller/v2/ping/`; dispatcher
-  activity; the metrics endpoint; Redis; PostgreSQL; Receptor container.
+  activity; the metrics endpoint; **instance and capacity health** (with a token:
+  confirms this node is enabled with capacity > 0, and reports every mesh node's
+  health — the control-plane's view of the receptor mesh); Redis; PostgreSQL;
+  Receptor container.
 - **hub** — Pulp api/content/worker containers; the unauthenticated Pulp status
   endpoint (parsed for DB-connected + online worker count); Redis; PostgreSQL.
 - **eda** — EDA api/worker containers; the EDA API; Redis; PostgreSQL.
-- **execution** — Receptor container; execution environment images present; and
-  a warning if control-plane containers are running where they shouldn't be.
+- **execution** — Receptor container; a receptor-log scan for mesh dialing/TLS
+  failures; execution environment images present; and a warning if control-plane
+  containers are running where they shouldn't be.
+
+The instance/capacity check needs a token (`--token`) to read
+`/api/controller/v2/instances/`; without one it reports an INFO rather than
+failing. Migration checks try the component's management command
+(`awx-manage`, `pulpcore-manager`, `aap-gateway-manage`, `aap-eda-manage`) and
+skip with an INFO if it isn't found rather than failing.
 
 Container discovery is pattern-based off `podman ps`, so it adapts to naming
 differences. If a component's container name doesn't match, you'll see a
