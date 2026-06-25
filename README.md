@@ -26,16 +26,22 @@ state. It never restarts services, edits config, or writes files.
 The script degrades gracefully when an optional tool or permission is missing —
 it reports INFO/WARN rather than crashing.
 
+Before any checks run, the script validates that the required RPMs — `iproute`
+(provides `ss`; accepted as `iproute2` on non-RHEL hosts), `curl`, and `podman`
+— are installed, and aborts with exit code `1` if any are missing.
+
 ## Installation
 
 ```bash
 chmod +x aap26-healthcheck.sh
 ```
 
+If your filesystem is mounted `noexec`, run it with `bash aap26-healthcheck.sh ...`.
+
 ## Usage
 
 ```
-./aap26-healthcheck.sh --nodetype <controller|gateway|hub|eda|execution|all> --api-host https://your-cluster.example.com --token-file ./mytoken
+./aap26-healthcheck.sh --nodetype <controller|gateway|hub|eda|execution|all> [options]
 ```
 
 ### Options
@@ -46,6 +52,8 @@ chmod +x aap26-healthcheck.sh
 | `--api-host HOST` | Base host for API probes. Default `https://localhost`. |
 | `--token TOKEN` | Bearer token for authenticated API calls. Visible in `ps`/history — prefer the options below. |
 | `--token-file FILE` | Read the bearer token from the first line of `FILE`. |
+| `--external-db` | The database is external/managed, not a local container. Skips the `postgresql_admin_password` secret requirement. Auto-detected when no local postgres container is found. |
+| `--db-host HOST[:PORT]` | External database host (implies `--external-db`). Enables a TCP reachability test to the DB; port defaults to 5432. |
 | `--log-lines N` | Lines of container log to scan for errors. Default `200`. |
 | `--verbose`, `-v` | Show extra detail (full container list, log excerpts, denial samples). |
 | `--no-color` | Disable colored output (useful for cron/CI logs). |
@@ -106,6 +114,10 @@ FAIL.
 
 - **Preflight** — Podman present and reachable, rootless flag, running user,
   `XDG_RUNTIME_DIR`, and the API auth mode.
+- **Hostname (FQDN)** — the system hostname must be a fully qualified domain
+  name (FAIL on a short name, IP address, or `localhost*`), with best-effort
+  checks that `hostname -f` and forward resolution agree. AAP requires every
+  node to have a resolvable FQDN; run the script on each node to cover them all.
 - **System resources** — available memory, load average, and disk usage on `/`,
   `/var`, `$HOME`, and the Podman graphroot.
 - **SELinux** — runtime mode (Enforcing = PASS, Permissive = WARN,
@@ -162,10 +174,20 @@ and validated according to node type.
 | execution | none (Receptor uses TLS certs, not these secrets) |
 | all | every group |
 
-**Topology note:** the `database` group lives on the node hosting the managed
-PostgreSQL. On a node that points at an external/remote database it will be
-absent and reported as FAIL — move `SECRETS_DATABASE` out of that node's branch
-in `validate_secrets` for that topology.
+**External / managed database:** when PostgreSQL runs outside AAP, the script
+detects it automatically (no local postgres container) — or you can be explicit
+with `--external-db`. In that mode it does **not** require the
+`postgresql_admin_password` secret (which only exists for an AAP-managed local
+DB), so the per-node connection secrets (`controller_postgres`,
+`gateway_db_password`, `eda_db_password`, `hub_database_fields`) are still
+validated, but the admin secret is skipped instead of producing a false FAIL.
+Add `--db-host HOST[:PORT]` to also run a TCP reachability test from the node to
+the external database (the 5432 source flow from the ports table):
+
+```bash
+./aap26-healthcheck.sh --nodetype controller --db-host db.example.com
+./aap26-healthcheck.sh --nodetype all --db-host 10.0.0.20:5432
+```
 
 ## Network listener validation
 
@@ -239,8 +261,8 @@ This makes it safe to drop into cron, a systemd timer, or a monitoring wrapper:
 The script is plain bash with small, single-purpose functions. Common tweaks:
 
 - **Different NGINX ports** → edit the port lists in `check_ports`.
-- **External database node** → remove `SECRETS_DATABASE` from that node's branch
-  in `validate_secrets`.
+- **External database node** → use `--external-db` (or `--db-host HOST[:PORT]`);
+  the `postgresql_admin_password` requirement is dropped automatically.
 - **Different container names** → adjust the `find_container` patterns in the
   relevant role function.
 - **EDA colocated on the controller** → add `SECRETS_EDA` to the `controller`
