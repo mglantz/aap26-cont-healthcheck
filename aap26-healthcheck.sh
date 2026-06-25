@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
 #
 # aap26-healthcheck.sh
-# Author: Magnus Glantz, sudo@redhat.com, 2026
-#
 # ---------------------------------------------------------------------------
 # Full health check for a containerized Ansible Automation Platform 2.6 node.
 #
@@ -42,6 +40,10 @@ USE_COLOR=1
 TOKEN=""
 TOKEN_FILE=""
 TOKEN_SOURCE=""
+EXTERNAL_DB=0      # set by --external-db; auto-detected otherwise
+DB_HOST=""         # external DB host (optional), enables a reachability test
+DB_PORT="5432"
+DB_EXTERNAL=0      # resolved at runtime (flag OR no local postgres container)
 
 PASS_COUNT=0
 WARN_COUNT=0
@@ -67,6 +69,12 @@ Options:
                         in the process list / shell history; prefer the methods
                         below for anything sensitive.
   --token-file FILE   Read the bearer token from FILE (first line).
+  --external-db       Database is external/managed (not a local container).
+                        Skips the postgresql_admin_password secret requirement.
+                        Auto-detected when no local postgres container is found.
+  --db-host HOST[:PORT]
+                      External database host (implies --external-db). Enables a
+                        TCP reachability test to the DB (default port 5432).
   --log-lines N       Lines of container log to scan for errors (default: 200)
   --verbose, -v       Show extra detail (full container list, log excerpts)
   --no-color          Disable colored output
@@ -89,6 +97,9 @@ while [[ $# -gt 0 ]]; do
     --token=*)   TOKEN="${1#*=}"; TOKEN_SOURCE="cli"; shift ;;
     --token-file)   TOKEN_FILE="${2:-}"; shift 2 ;;
     --token-file=*) TOKEN_FILE="${1#*=}"; shift ;;
+    --external-db)  EXTERNAL_DB=1; shift ;;
+    --db-host)      DB_HOST="${2:-}"; EXTERNAL_DB=1; shift 2 ;;
+    --db-host=*)    DB_HOST="${1#*=}"; EXTERNAL_DB=1; shift ;;
     --log-lines) LOG_LINES="${2:-}"; shift 2 ;;
     --log-lines=*) LOG_LINES="${1#*=}"; shift ;;
     -v|--verbose) VERBOSE=1; shift ;;
@@ -124,6 +135,13 @@ fi
 AUTH_ARGS=()
 if [[ -n "${TOKEN}" ]]; then
   AUTH_ARGS=(-H "Authorization: Bearer ${TOKEN}")
+fi
+
+# Split --db-host HOST[:PORT] into host + port (default 5432).
+if [[ -n "${DB_HOST}" && "${DB_HOST}" == *:* && "${DB_HOST}" != *:*:* ]]; then
+  DB_PORT="${DB_HOST##*:}"
+  DB_HOST="${DB_HOST%:*}"
+  [[ "${DB_PORT}" =~ ^[0-9]+$ ]] || DB_PORT="5432"
 fi
 
 # ----------------------------- expected secrets ----------------------------
@@ -542,16 +560,25 @@ common_checks() {
 # Validate the podman secrets expected for this node type. Uses
 # 'podman secret exists NAME'; ONLY exit code 0 counts as present.
 validate_secrets() {
+  # The database-admin secret only exists when AAP manages a local PostgreSQL;
+  # with an external database it is absent by design, so drop it in that mode.
+  local -a dbg=()
+  if [[ "${DB_EXTERNAL}" -eq 1 ]]; then
+    info "Database is external — not requiring ${SECRETS_DATABASE[*]} (managed outside AAP)"
+  else
+    dbg=("${SECRETS_DATABASE[@]}")
+  fi
+
   local -a expected=()
   case "${NODETYPE}" in
-    gateway)    expected=("${SECRETS_DATABASE[@]}" "${SECRETS_GATEWAY[@]}") ;;
-    controller) expected=("${SECRETS_DATABASE[@]}" "${SECRETS_CONTROLLER[@]}") ;;
-    hub)        expected=("${SECRETS_DATABASE[@]}" "${SECRETS_HUB[@]}") ;;
-    eda)        expected=("${SECRETS_DATABASE[@]}" "${SECRETS_EDA[@]}") ;;
+    gateway)    expected=("${dbg[@]}" "${SECRETS_GATEWAY[@]}") ;;
+    controller) expected=("${dbg[@]}" "${SECRETS_CONTROLLER[@]}") ;;
+    hub)        expected=("${dbg[@]}" "${SECRETS_HUB[@]}") ;;
+    eda)        expected=("${dbg[@]}" "${SECRETS_EDA[@]}") ;;
     execution)
       info "Execution nodes carry no application secrets (Receptor uses TLS certs) — no podman secrets to validate."
       return ;;
-    all)        expected=("${SECRETS_DATABASE[@]}" "${SECRETS_GATEWAY[@]}" \
+    all)        expected=("${dbg[@]}" "${SECRETS_GATEWAY[@]}" \
                           "${SECRETS_CONTROLLER[@]}" "${SECRETS_EDA[@]}" "${SECRETS_HUB[@]}") ;;
   esac
 
@@ -601,19 +628,43 @@ check_redis() {
 
 check_postgres() {
   local c; c="$(find_container 'postgres')"
-  if [[ -z "${c}" ]]; then
-    info "No local PostgreSQL container — database is likely external/managed. Verify connectivity from app logs."
+
+  # Local managed PostgreSQL container.
+  if [[ -n "${c}" ]]; then
+    if exec_in "${c}" pg_isready >/dev/null 2>&1; then
+      pass "PostgreSQL (${c}) accepting connections"
+      if [[ "${VERBOSE}" -eq 1 ]]; then
+        local conns
+        conns="$(exec_in "${c}" psql -tAc 'SELECT count(*) FROM pg_stat_activity;' 2>/dev/null)"
+        [[ -n "${conns}" ]] && detail "Active backends: ${conns}"
+      fi
+    else
+      fail "PostgreSQL (${c}) not ready (pg_isready failed)"
+    fi
     return
   fi
-  if exec_in "${c}" pg_isready >/dev/null 2>&1; then
-    pass "PostgreSQL (${c}) accepting connections"
-    if [[ "${VERBOSE}" -eq 1 ]]; then
-      local conns
-      conns="$(exec_in "${c}" psql -tAc 'SELECT count(*) FROM pg_stat_activity;' 2>/dev/null)"
-      [[ -n "${conns}" ]] && detail "Active backends: ${conns}"
-    fi
+
+  # No local container: the database is external/managed.
+  info "No local PostgreSQL container — database is external/managed"
+  if [[ -n "${DB_HOST}" ]]; then
+    check_db_reachable "${DB_HOST}" "${DB_PORT}"
   else
-    fail "PostgreSQL (${c}) not ready (pg_isready failed)"
+    info "Pass --db-host HOST[:PORT] to test reachability to the external database (default port 5432)"
+  fi
+}
+
+# TCP reachability test to an external database (node -> external DB, the 5432
+# source flow from Table 4). Uses bash /dev/tcp so no extra client is required.
+check_db_reachable() {
+  local host="$1" port="$2"
+  if ! have timeout; then
+    info "External DB reachability test needs 'timeout' (coreutils) — verify ${host}:${port} manually"
+    return
+  fi
+  if timeout 5 bash -c "exec 3<>/dev/tcp/${host}/${port}" 2>/dev/null; then
+    pass "External PostgreSQL ${host}:${port} reachable from this node (TCP)"
+  else
+    fail "External PostgreSQL ${host}:${port} not reachable from this node — check network/firewall and the DB host"
   fi
 }
 
@@ -927,6 +978,15 @@ printf 'Node type: %s   Host: %s   %s\n' "${NODETYPE}" "$(hostname -f 2>/dev/nul
 
 check_prerequisites
 preflight
+
+# Resolve whether the database is external: explicit flag, OR no local
+# PostgreSQL container present (auto-detect). Affects secret + DB validation.
+if [[ "${EXTERNAL_DB}" -eq 1 || -z "$(find_container 'postgres')" ]]; then
+  DB_EXTERNAL=1
+else
+  DB_EXTERNAL=0
+fi
+
 common_checks
 check_ports
 
