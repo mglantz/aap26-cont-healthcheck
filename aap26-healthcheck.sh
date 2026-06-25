@@ -44,6 +44,10 @@ EXTERNAL_DB=0      # set by --external-db; auto-detected otherwise
 DB_HOST=""         # external DB host (optional), enables a reachability test
 DB_PORT="5432"
 DB_EXTERNAL=0      # resolved at runtime (flag OR no local postgres container)
+EXTERNAL_REDIS=0   # set by --external-redis; auto-detected otherwise
+REDIS_HOST=""      # external Redis host (optional), enables a reachability test
+REDIS_PORT="6379"
+REDIS_EXTERNAL=0   # resolved at runtime (flag OR no local redis container)
 
 PASS_COUNT=0
 WARN_COUNT=0
@@ -75,6 +79,11 @@ Options:
   --db-host HOST[:PORT]
                       External database host (implies --external-db). Enables a
                         TCP reachability test to the DB (default port 5432).
+  --external-redis    Redis is external/managed (not a local container).
+                        Auto-detected when no local redis container is found.
+  --redis-host HOST[:PORT]
+                      External Redis host (implies --external-redis). Enables a
+                        TCP reachability test to Redis (default port 6379).
   --log-lines N       Lines of container log to scan for errors (default: 200)
   --verbose, -v       Show extra detail (full container list, log excerpts)
   --no-color          Disable colored output
@@ -100,6 +109,9 @@ while [[ $# -gt 0 ]]; do
     --external-db)  EXTERNAL_DB=1; shift ;;
     --db-host)      DB_HOST="${2:-}"; EXTERNAL_DB=1; shift 2 ;;
     --db-host=*)    DB_HOST="${1#*=}"; EXTERNAL_DB=1; shift ;;
+    --external-redis) EXTERNAL_REDIS=1; shift ;;
+    --redis-host)     REDIS_HOST="${2:-}"; EXTERNAL_REDIS=1; shift 2 ;;
+    --redis-host=*)   REDIS_HOST="${1#*=}"; EXTERNAL_REDIS=1; shift ;;
     --log-lines) LOG_LINES="${2:-}"; shift 2 ;;
     --log-lines=*) LOG_LINES="${1#*=}"; shift ;;
     -v|--verbose) VERBOSE=1; shift ;;
@@ -142,6 +154,13 @@ if [[ -n "${DB_HOST}" && "${DB_HOST}" == *:* && "${DB_HOST}" != *:*:* ]]; then
   DB_PORT="${DB_HOST##*:}"
   DB_HOST="${DB_HOST%:*}"
   [[ "${DB_PORT}" =~ ^[0-9]+$ ]] || DB_PORT="5432"
+fi
+
+# Split --redis-host HOST[:PORT] into host + port (default 6379).
+if [[ -n "${REDIS_HOST}" && "${REDIS_HOST}" == *:* && "${REDIS_HOST}" != *:*:* ]]; then
+  REDIS_PORT="${REDIS_HOST##*:}"
+  REDIS_HOST="${REDIS_HOST%:*}"
+  [[ "${REDIS_PORT}" =~ ^[0-9]+$ ]] || REDIS_PORT="6379"
 fi
 
 # ----------------------------- expected secrets ----------------------------
@@ -619,11 +638,20 @@ scan_logs_common() {
 # ----------------------------- shared probes -------------------------------
 check_redis() {
   local c; c="$(find_container 'redis')"
-  if [[ -z "${c}" ]]; then
-    warn "No Redis container found locally (may be remote/shared)"
+
+  # Local Redis container.
+  if [[ -n "${c}" ]]; then
+    pass "Redis container present (${c})"
     return
   fi
-  pass "Redis container present (${c})"
+
+  # No local container: Redis is external/managed (or runs on another node).
+  info "No local Redis container — Redis is external/managed"
+  if [[ -n "${REDIS_HOST}" ]]; then
+    check_tcp_reachable "External Redis" "${REDIS_HOST}" "${REDIS_PORT}"
+  else
+    info "Pass --redis-host HOST[:PORT] to test reachability to the external Redis (default port 6379)"
+  fi
 }
 
 check_postgres() {
@@ -647,24 +675,24 @@ check_postgres() {
   # No local container: the database is external/managed.
   info "No local PostgreSQL container — database is external/managed"
   if [[ -n "${DB_HOST}" ]]; then
-    check_db_reachable "${DB_HOST}" "${DB_PORT}"
+    check_tcp_reachable "External PostgreSQL" "${DB_HOST}" "${DB_PORT}"
   else
     info "Pass --db-host HOST[:PORT] to test reachability to the external database (default port 5432)"
   fi
 }
 
-# TCP reachability test to an external database (node -> external DB, the 5432
-# source flow from Table 4). Uses bash /dev/tcp so no extra client is required.
-check_db_reachable() {
-  local host="$1" port="$2"
+# Generic TCP reachability test (node -> external service, e.g. the 5432/6379
+# source flows from Table 4). Uses bash /dev/tcp so no extra client is required.
+check_tcp_reachable() {
+  local label="$1" host="$2" port="$3"
   if ! have timeout; then
-    info "External DB reachability test needs 'timeout' (coreutils) — verify ${host}:${port} manually"
+    info "${label} reachability test needs 'timeout' (coreutils) — verify ${host}:${port} manually"
     return
   fi
   if timeout 5 bash -c "exec 3<>/dev/tcp/${host}/${port}" 2>/dev/null; then
-    pass "External PostgreSQL ${host}:${port} reachable from this node (TCP)"
+    pass "${label} ${host}:${port} reachable from this node (TCP)"
   else
-    fail "External PostgreSQL ${host}:${port} not reachable from this node — check network/firewall and the DB host"
+    fail "${label} ${host}:${port} not reachable from this node — check network/firewall and the host"
   fi
 }
 
@@ -985,6 +1013,13 @@ if [[ "${EXTERNAL_DB}" -eq 1 || -z "$(find_container 'postgres')" ]]; then
   DB_EXTERNAL=1
 else
   DB_EXTERNAL=0
+fi
+
+# Resolve whether Redis is external: explicit flag, OR no local Redis container.
+if [[ "${EXTERNAL_REDIS}" -eq 1 || -z "$(find_container 'redis')" ]]; then
+  REDIS_EXTERNAL=1
+else
+  REDIS_EXTERNAL=0
 fi
 
 common_checks
