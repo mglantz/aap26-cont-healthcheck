@@ -453,9 +453,53 @@ check_hostname() {
   fi
 }
 
+# ----------------------------- time sync -----------------------------------
+# Clock skew silently breaks TLS validation, OAuth tokens, and the receptor
+# mesh — and surfaces as confusing auth/cert errors elsewhere.
+check_time_sync() {
+  section "Time synchronization"
+  if have timedatectl; then
+    local synced; synced="$(timedatectl show -p NTPSynchronized --value 2>/dev/null)"
+    case "${synced}" in
+      yes) pass "Clock is NTP-synchronized" ;;
+      no)  fail "Clock is NOT NTP-synchronized — skew breaks TLS, tokens, and the receptor mesh" ;;
+      *)   info "Could not determine NTP sync state via timedatectl" ;;
+    esac
+    if [[ "${VERBOSE}" -eq 1 ]] && have chronyc; then
+      local off; off="$(chronyc tracking 2>/dev/null | awk -F': ' '/Last offset/{print $2}')"
+      [[ -n "${off}" ]] && detail "chrony last offset:${off}"
+    fi
+  elif have chronyc; then
+    if chronyc tracking >/dev/null 2>&1; then pass "chrony is tracking a time source"
+    else warn "chronyc present but not tracking a source"; fi
+  else
+    info "No timedatectl/chronyc found — verify NTP time sync manually"
+  fi
+}
+
+# ----------------------------- subuid / subgid ------------------------------
+# Rootless Podman (and therefore EE execution) needs a subordinate UID/GID
+# range for the install user; without it, containers fail to start.
+check_subid() {
+  section "User namespace mappings (rootless)"
+  local u uid f
+  u="$(id -un)"; uid="$(id -u)"
+  for f in /etc/subuid /etc/subgid; do
+    if [[ ! -r "${f}" ]]; then
+      info "${f} not readable — cannot verify subordinate ID range for ${u}"
+    elif grep -qE "^(${u}|${uid}):" "${f}" 2>/dev/null; then
+      pass "${f}: subordinate ID range present for ${u}"
+    else
+      fail "${f}: no subordinate ID range for ${u} — rootless containers/EEs cannot start"
+    fi
+  done
+}
+
 # ----------------------------- common checks -------------------------------
 common_checks() {
   check_hostname
+  check_time_sync
+  check_subid
 
   section "System resources"
 
@@ -725,6 +769,154 @@ probe_api() {
   fi
 }
 
+# Strip scheme/path/port from API_HOST to get a bare hostname for TLS/SNI.
+api_host_only() {
+  local h="${API_HOST#*://}"; h="${h%%/*}"; h="${h%%:*}"
+  printf '%s' "${h}"
+}
+
+# Certificate expiry on an HTTPS listener. WARN within `days`, FAIL if expired.
+# We curl with -k everywhere, so without this an expiring cert is invisible.
+check_cert_expiry() {
+  local host="$1" port="$2" label="$3" days="${4:-30}"
+  if ! have openssl; then
+    info "openssl not available — skipping ${label} certificate check"
+    return
+  fi
+  local raw
+  if have timeout; then
+    raw="$(echo | timeout 10 openssl s_client -connect "${host}:${port}" -servername "${host}" 2>/dev/null)"
+  else
+    raw="$(echo | openssl s_client -connect "${host}:${port}" -servername "${host}" 2>/dev/null)"
+  fi
+  local cert; cert="$(printf '%s' "${raw}" | openssl x509 2>/dev/null)"
+  if [[ -z "${cert}" ]]; then
+    info "${label}: no certificate retrieved from ${host}:${port} (TLS not exposed there?)"
+    return
+  fi
+  local enddate; enddate="$(printf '%s' "${cert}" | openssl x509 -noout -enddate 2>/dev/null | cut -d= -f2)"
+  if ! printf '%s' "${cert}" | openssl x509 -checkend 0 >/dev/null 2>&1; then
+    fail "${label} certificate has EXPIRED (notAfter: ${enddate})"
+  elif ! printf '%s' "${cert}" | openssl x509 -checkend "$((days*86400))" >/dev/null 2>&1; then
+    warn "${label} certificate expires within ${days} days (notAfter: ${enddate})"
+  else
+    pass "${label} certificate valid (notAfter: ${enddate})"
+  fi
+}
+
+# Database migrations applied? After an upgrade, containers come up but the app
+# is broken if migrations did not run. Tries candidate manage commands; skips
+# (INFO) rather than failing if none is present in the container.
+check_migrations() {
+  local c="$1" label="$2"; shift 2
+  [[ -z "${c}" ]] && return
+  local cand cmd=""
+  for cand in "$@"; do
+    if exec_in "${c}" sh -c "command -v ${cand}" >/dev/null 2>&1; then cmd="${cand}"; break; fi
+  done
+  if [[ -z "${cmd}" ]]; then
+    info "${label}: no management command in ${c} (tried: $*) — migration check skipped"
+    return
+  fi
+  local out; out="$(exec_in "${c}" sh -c "${cmd} showmigrations 2>/dev/null")"
+  if [[ -z "${out}" ]]; then
+    info "${label}: '${cmd} showmigrations' produced no output — skipped"
+    return
+  fi
+  local unapplied; unapplied="$(printf '%s\n' "${out}" | grep -c '\[ \]' || true)"
+  if [[ "${unapplied}" -gt 0 ]]; then
+    fail "${label}: ${unapplied} unapplied database migration(s) — run the installer to migrate"
+  else
+    pass "${label}: all database migrations applied"
+  fi
+}
+
+# Controller instance + capacity health, which is also the control-plane's view
+# of the receptor mesh (every controller/hop/execution node and its capacity).
+# FAILs if the local node is disabled or has zero capacity (cannot run jobs).
+check_controller_instances() {
+  local url="${API_HOST}/api/controller/v2/instances/"
+  local code; code="$(http_code "${url}")"
+  if [[ "${code}" =~ ^(401|403)$ && -z "${TOKEN}" ]]; then
+    info "Instance/capacity detail needs auth — pass --token to validate mesh capacity"
+    return
+  fi
+  if ! have python3; then
+    info "python3 not available — skipping instance/capacity parsing"
+    return
+  fi
+  local json; json="$(curl -sk -m 10 "${AUTH_ARGS[@]}" "${url}" 2>/dev/null)"
+  [[ -z "${json}" ]] && { info "Controller instances: no data returned"; return; }
+
+  local me; me="$(hostname -f 2>/dev/null || hostname 2>/dev/null)"
+  local parsed
+  parsed="$(printf '%s' "${json}" | python3 -c '
+import sys, json
+me = sys.argv[1] if len(sys.argv) > 1 else ""
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    print("ERR"); sys.exit(0)
+res = d.get("results", d if isinstance(d, list) else [])
+if not res:
+    print("NONE"); sys.exit(0)
+for i in res:
+    node = i.get("hostname") or i.get("node") or "?"
+    print("\t".join([
+        str(node),
+        str(i.get("node_type", "")),
+        str(i.get("enabled")),
+        str(i.get("capacity")),
+        "1" if me and node == me else "0",
+    ]))
+' "${me}" 2>/dev/null)"
+  case "${parsed}" in
+    ERR|"") info "Controller instances: response not parseable"; return ;;
+    NONE)   warn "Controller reports no instances"; return ;;
+  esac
+
+  local node ntype enabled cap local_n found_local=0
+  while IFS=$'\t' read -r node ntype enabled cap local_n; do
+    [[ -z "${node}" ]] && continue
+    local msg="instance ${node} (${ntype}) enabled=${enabled} capacity=${cap}"
+    if [[ "${local_n}" == "1" ]]; then
+      found_local=1
+      if [[ "${enabled}" != "True" ]]; then
+        fail "Local ${msg} — node is DISABLED"
+      elif [[ "${cap}" == "0" || "${cap}" == "None" ]]; then
+        fail "Local ${msg} — ZERO capacity (cannot run jobs)"
+      else
+        pass "Local ${msg}"
+      fi
+    else
+      if [[ "${enabled}" != "True" || "${cap}" == "0" || "${cap}" == "None" ]]; then
+        warn "Peer ${msg} — disabled or no capacity"
+      else
+        detail "Peer ${msg}"
+      fi
+    fi
+  done <<< "${parsed}"
+  [[ "${found_local}" -eq 0 ]] && info "This node's hostname (${me}) was not found in the controller instance list"
+}
+
+# Execution-node mesh health WITHOUT receptorctl: an ESTABLISHED TCP session on
+# the receptor port is strong evidence the node is joined; logs catch dialing
+# failures.
+check_mesh_execution() {
+  local c; c="$(find_container 'receptor')"
+  [[ -z "${c}" ]] && return
+
+  # Scan recent receptor logs for mesh dialing/TLS failures.
+  local errs
+  errs="$(podman logs --tail "${LOG_LINES}" "${c}" 2>&1 \
+          | grep -ciE 'connection refused|backoff|failed to connect|tls handshake|no route to host' || true)"
+  if [[ "${errs}" -gt 0 ]]; then
+    warn "Receptor log shows ${errs} connection-problem line(s) — check mesh peering/TLS"
+  else
+    pass "No receptor connection-error signatures in recent logs"
+  fi
+}
+
 # ----------------------------- port listeners ------------------------------
 # Validates the local listening ports per Table 4 (Network ports and protocols).
 # Only the DESTINATION side (a listener) is verifiable locally; outbound/source
@@ -829,6 +1021,14 @@ check_gateway() {
   probe_api "Gateway API" "${API_HOST}/api/gateway/v1/"
   probe_api "Platform login page" "${API_HOST}/"
 
+  # TLS cert behind the gateway entry point (we curl -k, so otherwise blind).
+  check_cert_expiry "$(api_host_only)" 443 "Gateway (443)"
+
+  # Gateway must actually proxy to the backends — probe each through it.
+  probe_api "Gateway -> Controller route" "${API_HOST}/api/controller/v2/ping/"
+  probe_api "Gateway -> Hub route"        "${API_HOST}/api/galaxy/pulp/api/v3/status/"
+  probe_api "Gateway -> EDA route"        "${API_HOST}/api/eda/v1/"
+
   # Fernet / secret-key mismatch surfaces as InvalidToken in gateway logs
   # during initialize_preferences(); call it out specifically.
   if [[ -n "${gw}" ]]; then
@@ -841,6 +1041,7 @@ check_gateway() {
     fi
   fi
 
+  check_migrations "${gw}" "Gateway" aap-gateway-manage gateway-manage
   check_redis
   check_postgres
 }
@@ -881,6 +1082,15 @@ check_controller() {
 
   # Metrics endpoint requires auth (expect 401/403 when unauthenticated).
   probe_api "Controller metrics endpoint" "${API_HOST}/api/controller/v2/metrics/"
+
+  # TLS cert on the controller's own NGINX listener.
+  check_cert_expiry localhost 8443 "Controller (8443)"
+
+  # Instance + capacity health (also the control-plane's mesh view).
+  check_controller_instances
+
+  # Migrations applied (broken silently after an upgrade if not).
+  check_migrations "${task:-${web}}" "Controller" awx-manage
 
   check_redis
   check_postgres
@@ -930,6 +1140,8 @@ except Exception: print("")' 2>/dev/null)"
   local graphroot; graphroot="$(podman info --format '{{.Store.GraphRoot}}' 2>/dev/null)"
   detail "Confirm artifact storage volume has headroom (often a dedicated mount)."
 
+  check_cert_expiry localhost 8444 "Hub (8444)"
+  check_migrations "${pulp_api:-${pulp_worker}}" "Hub" pulpcore-manager
   check_redis
   check_postgres   # hub DB is typically named 'pulp'
 }
@@ -961,7 +1173,10 @@ check_execution() {
     pass "No misplaced control-plane containers on this execution node"
   fi
 
-  info "Execution nodes reach the control plane over the receptor mesh — confirm this node appears in the controller's instance list."
+  # Mesh health: scan receptor logs for dialing/TLS failures.
+  check_mesh_execution
+
+  info "Execution nodes reach the control plane over the receptor mesh — confirm this node also appears (enabled, capacity>0) in the controller's instance list."
 }
 
 # ------------------------------ node: eda ----------------------------------
@@ -980,6 +1195,8 @@ check_eda() {
 
   probe_api "EDA API" "${API_HOST}/api/eda/v1/"
 
+  check_cert_expiry localhost 8445 "EDA (8445)"
+  check_migrations "${api:-${worker}}" "EDA" aap-eda-manage eda-manage
   check_redis
   check_postgres
 }
