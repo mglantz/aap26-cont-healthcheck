@@ -54,6 +54,8 @@ If your filesystem is mounted `noexec`, run it with `bash aap26-healthcheck.sh .
 | `--token-file FILE` | Read the bearer token from the first line of `FILE`. |
 | `--external-db` | The database is external/managed, not a local container. Skips the `postgresql_admin_password` secret requirement. Auto-detected when no local postgres container is found. |
 | `--db-host HOST[:PORT]` | External database host (implies `--external-db`). Enables a TCP reachability test to the DB; port defaults to 5432. |
+| `--external-redis` | Redis is external/managed, not a local container. Auto-detected when no local redis container is found. |
+| `--redis-host HOST[:PORT]` | External Redis host (implies `--external-redis`). Enables a TCP reachability test to Redis; port defaults to 6379. |
 | `--log-lines N` | Lines of container log to scan for errors. Default `200`. |
 | `--verbose`, `-v` | Show extra detail (full container list, log excerpts, denial samples). |
 | `--no-color` | Disable colored output (useful for cron/CI logs). |
@@ -189,6 +191,19 @@ the external database (the 5432 source flow from the ports table):
 ./aap26-healthcheck.sh --nodetype all --db-host 10.0.0.20:5432
 ```
 
+**External / managed Redis:** handled the same way. It's auto-detected when no
+local redis container is present (or set `--external-redis`), in which case the
+absence is reported as expected (INFO) rather than a warning. Add
+`--redis-host HOST[:PORT]` for a TCP reachability test from the node to the
+external Redis. There is no Redis equivalent of `postgresql_admin_password` to
+skip — `gateway_redis_url` is the connection config and is validated in both
+local and external modes.
+
+```bash
+./aap26-healthcheck.sh --nodetype gateway --redis-host redis.example.com
+./aap26-healthcheck.sh --nodetype all --db-host db.example.com --redis-host 10.0.0.30:6379
+```
+
 ## Network listener validation
 
 Derived from the AAP 2.6 "Network ports and protocols" table. Only the
@@ -263,6 +278,7 @@ The script is plain bash with small, single-purpose functions. Common tweaks:
 - **Different NGINX ports** → edit the port lists in `check_ports`.
 - **External database node** → use `--external-db` (or `--db-host HOST[:PORT]`);
   the `postgresql_admin_password` requirement is dropped automatically.
+- **External Redis** → use `--external-redis` (or `--redis-host HOST[:PORT]`).
 - **Different container names** → adjust the `find_container` patterns in the
   relevant role function.
 - **EDA colocated on the controller** → add `SECRETS_EDA` to the `controller`
