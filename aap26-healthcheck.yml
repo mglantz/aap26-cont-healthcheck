@@ -1,0 +1,153 @@
+---
+# Run the AAP 2.6 containerized healthcheck on every component node in an
+# AAP installation inventory, then print a consolidated report.
+#
+# Usage (from the repository root):
+#   ansible-playbook -i /path/to/aap/inventory aap26-healthcheck.yml
+#
+# Connect as the container install user (the same user Ansible uses for the
+# AAP installer). If you SSH as root, set ansible_become: true in
+# inventory or extra-vars.
+#
+# Optional inventory / extra-vars:
+#   aap_healthcheck_extra_args    - extra CLI args, e.g. ['--verbose', '--token-file', '/home/aap/.aap/token']
+#   aap_healthcheck_script_src    - local path to the script (default: repo root script)
+
+- name: Run AAP 2.6 containerized healthcheck on deployment nodes
+  hosts: all, !database
+  gather_facts: true
+
+  vars:
+    aap_aio_deployment: false
+    aap_healthcheck_script_src: "scripts/aap26-healthcheck.sh"
+    aap_healthcheck_extra_args: []
+    aap_healthcheck_node_type: "{{ group_names | difference(['all']) | first }}"
+    aap_api_token: !vault |
+          $ANSIBLE_VAULT;1.1;AES256
+          61643430663762663564316438666364356464643262643135333336363230353435653566393363
+          3864383934366232343134343163613561376437633535380a336166363539376163366536616435
+          66353730633137663738346632313665653663383233623062663865343238623031613034633438
+          6136303536666534360a353633306363393133623163333131346337333134396234313666623733
+          31353466633962656336353037313139353532326235643965653365613966636164
+    aap_db_host: "{{ groups['database'] | first }}"
+
+  tasks:
+    - name: Run healthcheck script for enterprise deployment
+      ansible.builtin.script:
+        cmd: >-
+          {{ aap_healthcheck_script_src }}
+          --nodetype {{ aap_healthcheck_node_type }}
+          --db-host {{ aap_db_host }}
+          --no-color
+          --no-header
+          --no-summary
+          {{ aap_healthcheck_extra_args | join(' ') }}
+      when: not aap_aio_deployment
+      register: aap_healthcheck_result_enterprise
+      changed_when: false
+      ignore_errors: true
+      environment:
+        AAP_TOKEN: "{{ aap_api_token }}"
+
+    - name: Run healthcheck script for aio deployment
+      ansible.builtin.script:
+        cmd: >-
+          {{ aap_healthcheck_script_src }}
+          --nodetype aio
+          --db-host {{ aap_db_host }}
+          --no-color
+          --no-header
+          --no-summary
+          {{ aap_healthcheck_extra_args | join(' ') }}
+      when: aap_aio_deployment
+      register: aap_healthcheck_result_aio
+      changed_when: false
+      ignore_errors: true
+      environment:
+        AAP_TOKEN: "{{ aap_api_token }}"
+
+    - name: Select healthcheck script result for this host
+      ansible.builtin.set_fact:
+        aap_healthcheck_result: "{{ aap_healthcheck_result_aio if aap_aio_deployment else aap_healthcheck_result_enterprise }}"
+
+    - name: Record healthcheck outcome for reporting play
+      when: not (aap_healthcheck_result.skipped | default(false))
+      vars:
+        aap_healthcheck_stdout: "{{ aap_healthcheck_result.stdout | default(aap_healthcheck_result.stdout_lines) }}"
+      ansible.builtin.set_fact:
+        aap_healthcheck_report:
+          hostname: "{{ inventory_hostname }}"
+          nodetype: "{{ 'aio' if aap_aio_deployment else aap_healthcheck_node_type }}"
+          stdout: "{{ aap_healthcheck_stdout }}"
+          failed: "{{ aap_healthcheck_result.rc != 0 }}"
+          pass: "{{ aap_healthcheck_stdout | regex_findall('\\[ PASS \\]') | length }}"
+          warn: "{{ aap_healthcheck_stdout | regex_findall('\\[ WARN \\]') | length }}"
+          fail: "{{ aap_healthcheck_stdout | regex_findall('\\[ FAIL \\]') | length }}"
+
+- name: Create healthcheck reports
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    aap_healthcheck_host_pattern: >-
+      automationgateway:automationcontroller:automationhub:automationeda:execution_nodes
+    aap_healthcheck_hosts: "{{ query('inventory_hostnames', aap_healthcheck_host_pattern) | sort }}"
+
+  tasks:
+    - name: Ensure reports directory exists
+      ansible.builtin.file:
+        path: "{{ playbook_dir }}/reports"
+        state: directory
+        mode: 0755
+
+    - name: Set report timestamp so it is consistent across all report files
+      ansible.builtin.set_fact:
+        aap_healthcheck_report_timestamp: "{{ now(utc=true, fmt='%Y-%m-%d %H:%M:%S') }}"
+
+    - name: Identify failed healthcheck hosts
+      ansible.builtin.set_fact:
+        aap_healthcheck_failed_hosts: >-
+          {%- set failed = [] -%}
+          {%- for h in aap_healthcheck_hosts -%}
+          {%- set report = hostvars[h].aap_healthcheck_report | default(none) -%}
+          {%- if report and (report.failed | bool) -%}
+          {%- set failed = failed + [h] -%}
+          {%- endif -%}
+          {%- endfor -%}
+          {{ failed }}
+
+    - name: Collect healthcheck reports from all hosts
+      ansible.builtin.set_fact:
+        aap_healthcheck_reports: >-
+          {{ aap_healthcheck_hosts
+             | map('extract', hostvars)
+             | map(attribute='aap_healthcheck_report', default=none)
+             | select('defined')
+             | list }}
+
+    - name: Create healthcheck reports for each AAP node
+      ansible.builtin.template:
+        src: aap26-healthcheck-node-report.txt.j2
+        dest: "{{ playbook_dir }}/reports/{{ aap_host }}-aap26-healthcheck-report-{{ aap_healthcheck_report_timestamp }}.txt"
+        mode: 0644
+      loop: "{{ aap_healthcheck_hosts }}"
+      when: hostvars[aap_host].aap_healthcheck_report is defined
+      loop_control:
+        loop_var: aap_host
+      vars:
+        aap_healthcheck_node_report: "{{ hostvars[aap_host].aap_healthcheck_report }}"
+
+    - name: Create full AAP healthcheck report
+      ansible.builtin.template:
+        src: aap26-healthcheck-report.txt.j2
+        dest: "{{ playbook_dir }}/reports/aap26-healthcheck-report-{{ aap_healthcheck_report_timestamp }}.txt"
+        mode: 0644
+      register: aap_healthcheck_report_file
+
+    - name: Fail playbook when any node healthcheck failed
+      ansible.builtin.fail:
+        msg: >-
+          Healthcheck failed on {{ aap_healthcheck_failed_hosts | join(', ') }}.
+          Review the report at {{ aap_healthcheck_report_file.dest }}.
+      when: aap_healthcheck_failed_hosts | length > 0
+...

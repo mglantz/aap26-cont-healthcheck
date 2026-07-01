@@ -1,0 +1,33 @@
+AAP 2.6 Containerised Health Check - Full Report
+================================================================================
+SUMMARY
+
+{% for host in aap_healthcheck_hosts -%}
+{% set report = hostvars[host].aap_healthcheck_report | default(none) -%}
+{{ '%-40s  nodetype=%-24s  %s' | format(
+  host,
+  report.nodetype if report else 'n/a',
+  'FAIL' if (report and (report.failed | bool)) else ('PASS' if report else 'SKIPPED')
+) }}
+{% endfor -%}
+
+TOTAL   PASS: {{ aap_healthcheck_reports | map(attribute='pass') | map('int') | sum }}   WARN: {{ aap_healthcheck_reports | map(attribute='warn') | map('int') | sum }}   FAIL: {{ aap_healthcheck_reports | map(attribute='fail') | map('int') | sum }}
+
+{% for host in aap_healthcheck_hosts -%}
+{% set report = hostvars[host].aap_healthcheck_report | default(none) -%}
+{% if report -%}
+================================================================================
+Host: {{ host }}
+Node type: {{ report.nodetype }}
+Status: {{ 'FAIL' if report.failed | bool else 'PASS' }}
+================================================================================
+{{ report.stdout }}
+
+{% else -%}
+================================================================================
+Host: {{ host }}
+Status: SKIPPED (not present in play or no recognised AAP role)
+================================================================================
+
+{% endif -%}
+{% endfor -%}
