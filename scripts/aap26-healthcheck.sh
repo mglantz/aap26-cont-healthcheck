@@ -9,16 +9,17 @@
 # unless your install genuinely runs rootful).
 #
 # Usage:
-#   ./aap26-healthcheck.sh --nodetype <controller|gateway|hub|execution|all> [options]
+#   ./aap26-healthcheck.sh --nodetype <GROUP> [options]
 #
 # Options:
-#   --nodetype TYPE     Role of this node (required). One of:
-#                         controller  - Automation Controller
-#                         gateway     - Platform Gateway (+ Envoy proxy)
-#                         hub         - Automation Hub (Pulp)
-#                         execution   - Execution node (Receptor only)
-#                         all         - All-in-one / single-node deployment
-#   --api-host HOST     Base host for API probes (default: https://localhost)
+#   --nodetype TYPE     Role of this node (required). Use the AAP 2.6 installer
+#                         inventory group name for this host, or `aio` for an
+#                         all-in-one node:
+#                         automationgateway | automationcontroller |
+#                         automationhub | automationeda |
+#                         automationedacontroller | execution_nodes | aio
+#   --api-host HOST     Base host for API probes (default: this node's FQDN on
+#                         the HTTPS port for the selected --nodetype)
 #   --log-lines N       Lines of container log to scan for errors (default: 200)
 #   --verbose, -v       Show extra detail (full container list, log excerpts)
 #   --no-color          Disable colored output
@@ -52,6 +53,8 @@ REDIS_EXTERNAL=0   # resolved at runtime (flag OR no local redis container)
 PASS_COUNT=0
 WARN_COUNT=0
 FAIL_COUNT=0
+NO_HEADER=0
+NO_SUMMARY=0
 
 # ----------------------------- arg parsing ---------------------------------
 print_help() {
@@ -63,12 +66,17 @@ by systemd *user* units. Run this script AS THAT USER (not root, unless your
 install genuinely runs rootful).
 
 Usage:
-  ./aap26-healthcheck.sh --nodetype <controller|gateway|hub|execution|all> [options]
+  ./aap26-healthcheck.sh --nodetype <GROUP> [options]
 
 Options:
-  --nodetype TYPE     Role of this node (required):
-                        controller | gateway | hub | eda | execution | all
-  --api-host HOST     Base host for API probes (default: https://localhost)
+  --nodetype TYPE     Role of this node (required). Use the AAP 2.6 installer
+                        inventory group name, or `aio` for all-in-one:
+                        automationgateway | automationcontroller |
+                        automationhub | automationeda |
+                        automationedacontroller | execution_nodes | aio
+  --api-host HOST     Base host for API probes (default: this node's FQDN on the
+                        HTTPS port for the selected --nodetype; gateway 443,
+                        controller 8443, hub 8444, eda 8445)
   --token TOKEN       Bearer token for authenticated API calls. NOTE: visible
                         in the process list / shell history; prefer the methods
                         below for anything sensitive.
@@ -87,6 +95,8 @@ Options:
   --log-lines N       Lines of container log to scan for errors (default: 200)
   --verbose, -v       Show extra detail (full container list, log excerpts)
   --no-color          Disable colored output
+  --no-header         Omit the title and node-type/host/date banner (for report embedding)
+  --no-summary        Omit the summary section at the end (for report embedding)
   --help, -h          Show this help
 
 A token may also be supplied via the AAP_TOKEN environment variable.
@@ -116,6 +126,8 @@ while [[ $# -gt 0 ]]; do
     --log-lines=*) LOG_LINES="${1#*=}"; shift ;;
     -v|--verbose) VERBOSE=1; shift ;;
     --no-color)  USE_COLOR=0; shift ;;
+    --no-header) NO_HEADER=1; shift ;;
+    --no-summary) NO_SUMMARY=1; shift ;;
     -h|--help)   print_help; exit 0 ;;
     *) echo "Unknown argument: $1" >&2; echo "Try --help" >&2; exit 2 ;;
   esac
@@ -123,9 +135,11 @@ done
 
 NODETYPE="$(echo "${NODETYPE}" | tr '[:upper:]' '[:lower:]')"
 case "${NODETYPE}" in
-  controller|gateway|hub|eda|execution|all) ;;
+  automationgateway|automationcontroller|automationhub|automationeda|automationedacontroller|execution_nodes|aio) ;;
   "") echo "ERROR: --nodetype is required." >&2; echo "Try --help" >&2; exit 2 ;;
-  *)  echo "ERROR: invalid --nodetype '${NODETYPE}'." >&2; echo "Valid: controller, gateway, hub, eda, execution, all" >&2; exit 2 ;;
+  *)  echo "ERROR: invalid --nodetype '${NODETYPE}'." >&2
+      echo "Valid: automationgateway, automationcontroller, automationhub, automationeda, automationedacontroller, execution_nodes, aio" >&2
+      exit 2 ;;
 esac
 
 # ----------------------------- token resolution ----------------------------
@@ -172,7 +186,7 @@ SECRETS_DATABASE=(postgresql_admin_password)
 SECRETS_GATEWAY=(gateway_secret_key gateway_db_password gateway_admin_password gateway_redis_url)
 SECRETS_CONTROLLER=(controller_channels controller_resource_server controller_postgres controller_secret_key)
 SECRETS_EDA=(eda_resource_server eda_secret_key eda_admin_password eda_db_password)
-SECRETS_HUB=(hub_secret_key hub_collection_signing_passphrase hub_settings hub_database_fields hub_resource_server hub_container_signing_passphrase)
+SECRETS_HUB=(hub_secret_key hub_settings hub_database_fields hub_resource_server)
 
 # ----------------------------- output helpers ------------------------------
 if [[ "${USE_COLOR}" -eq 1 && -t 1 ]]; then
@@ -634,14 +648,15 @@ validate_secrets() {
 
   local -a expected=()
   case "${NODETYPE}" in
-    gateway)    expected=("${dbg[@]}" "${SECRETS_GATEWAY[@]}") ;;
-    controller) expected=("${dbg[@]}" "${SECRETS_CONTROLLER[@]}") ;;
-    hub)        expected=("${dbg[@]}" "${SECRETS_HUB[@]}") ;;
-    eda)        expected=("${dbg[@]}" "${SECRETS_EDA[@]}") ;;
-    execution)
+    automationgateway)        expected=("${dbg[@]}" "${SECRETS_GATEWAY[@]}") ;;
+    automationcontroller)     expected=("${dbg[@]}" "${SECRETS_CONTROLLER[@]}") ;;
+    automationhub)            expected=("${dbg[@]}" "${SECRETS_HUB[@]}") ;;
+    automationeda|automationedacontroller)
+                              expected=("${dbg[@]}" "${SECRETS_EDA[@]}") ;;
+    execution_nodes)
       info "Execution nodes carry no application secrets (Receptor uses TLS certs) — no podman secrets to validate."
       return ;;
-    all)        expected=("${dbg[@]}" "${SECRETS_GATEWAY[@]}" \
+    aio)        expected=("${dbg[@]}" "${SECRETS_GATEWAY[@]}" \
                           "${SECRETS_CONTROLLER[@]}" "${SECRETS_EDA[@]}" "${SECRETS_HUB[@]}") ;;
   esac
 
@@ -770,7 +785,33 @@ probe_api() {
 }
 
 # Strip scheme/path/port from API_HOST to get a bare hostname for TLS/SNI.
+node_fqdn() {
+  hostname -f 2>/dev/null || hostname
+}
+
+# Role-local HTTPS base URL. When --api-host was not supplied (still the
+# default https://localhost), use this node's FQDN on the component's HTTPS
+# port. Each AAP role listens on its own port (443/8443/8444/8445), so probing
+# https://localhost without a port only works on the gateway.
+effective_api_host() {
+  local port="${1:-443}"
+  if [[ "${API_HOST}" != "https://localhost" ]]; then
+    printf '%s' "${API_HOST}"
+    return
+  fi
+  local h; h="$(node_fqdn)"
+  if [[ "${port}" == "443" ]]; then
+    printf 'https://%s' "${h}"
+  else
+    printf 'https://%s:%s' "${h}" "${port}"
+  fi
+}
+
 api_host_only() {
+  if [[ "${API_HOST}" == "https://localhost" ]]; then
+    node_fqdn
+    return
+  fi
   local h="${API_HOST#*://}"; h="${h%%/*}"; h="${h%%:*}"
   printf '%s' "${h}"
 }
@@ -835,7 +876,7 @@ check_migrations() {
 # of the receptor mesh (every controller/hop/execution node and its capacity).
 # FAILs if the local node is disabled or has zero capacity (cannot run jobs).
 check_controller_instances() {
-  local url="${API_HOST}/api/controller/v2/instances/"
+  local url; url="$(effective_api_host 8443)/api/controller/v2/instances/"
   local code; code="$(http_code "${url}")"
   if [[ "${code}" =~ ^(401|403)$ && -z "${TOKEN}" ]]; then
     info "Instance/capacity detail needs auth — pass --token to validate mesh capacity"
@@ -971,24 +1012,26 @@ check_ports() {
   # Component NGINX ports (configurable via the *_nginx_http/https_port vars)
   # plus the gateway external HTTPS entry (443).
   case "${NODETYPE}" in
-    gateway)    check_listen fail 443 8446 ;;
-    controller) check_listen fail 8443;  check_listen warn 8080 ;;
-    hub)        check_listen fail 8444;  check_listen warn 8081 ;;
-    eda)        check_listen fail 8445;  check_listen warn 8082 ;;
-    execution)  info "No listener ports validated for execution nodes." ;;
-    all)        check_listen fail 443 8443 8444 8445 8446
+    automationgateway)        check_listen fail 443 8446 ;;
+    automationcontroller)     check_listen fail 8443;  check_listen warn 8080 ;;
+    automationhub)            check_listen fail 8444;  check_listen warn 8081 ;;
+    automationeda|automationedacontroller)
+                              check_listen fail 8445;  check_listen warn 8082 ;;
+    execution_nodes)          info "No listener ports validated for execution nodes." ;;
+    aio)        check_listen fail 443 8443 8444 8445 8446
                 check_listen warn 8080 8081 8082 ;;
   esac
 
   # PostgreSQL (5432) — controller/gateway/hub/eda all connect to the DB.
   case "${NODETYPE}" in
-    gateway|controller|hub|eda|all) check_infra_port postgres 5432 "PostgreSQL" ;;
+    automationgateway|automationcontroller|automationhub|automationeda|automationedacontroller|aio)
+      check_infra_port postgres 5432 "PostgreSQL" ;;
   esac
 
   # Redis (6379) — gateway and EDA are the documented Redis clients; cluster
   # bus (16379) only on a clustered (multi-node HA) Redis.
   case "${NODETYPE}" in
-    gateway|eda|all)
+    automationgateway|automationeda|automationedacontroller|aio)
       check_infra_port redis 6379 "Redis"
       local rc; rc="$(find_container redis)"
       if [[ -n "${rc}" ]]; then
@@ -1018,16 +1061,16 @@ check_gateway() {
     warn "No Envoy/proxy container matched"
   fi
 
-  probe_api "Gateway API" "${API_HOST}/api/gateway/v1/"
-  probe_api "Platform login page" "${API_HOST}/"
+  probe_api "Gateway API" "$(effective_api_host 443)/api/gateway/v1/"
+  probe_api "Platform login page" "$(effective_api_host 443)/"
 
   # TLS cert behind the gateway entry point (we curl -k, so otherwise blind).
   check_cert_expiry "$(api_host_only)" 443 "Gateway (443)"
 
   # Gateway must actually proxy to the backends — probe each through it.
-  probe_api "Gateway -> Controller route" "${API_HOST}/api/controller/v2/ping/"
-  probe_api "Gateway -> Hub route"        "${API_HOST}/api/galaxy/pulp/api/v3/status/"
-  probe_api "Gateway -> EDA route"        "${API_HOST}/api/eda/v1/"
+  probe_api "Gateway -> Controller route" "$(effective_api_host 443)/api/controller/v2/ping/"
+  probe_api "Gateway -> Hub route"        "$(effective_api_host 443)/api/galaxy/pulp/api/v3/status/"
+  probe_api "Gateway -> EDA route"        "$(effective_api_host 443)/api/eda/v1/"
 
   # Fernet / secret-key mismatch surfaces as InvalidToken in gateway logs
   # during initialize_preferences(); call it out specifically.
@@ -1061,9 +1104,10 @@ check_controller() {
   fi
 
   # /ping/ is unauthenticated and reports HA instances + capacity.
-  probe_api "Controller API ping" "${API_HOST}/api/controller/v2/ping/"
+  local ctrl_api; ctrl_api="$(effective_api_host 8443)"
+  probe_api "Controller API ping" "${ctrl_api}/api/controller/v2/ping/"
   local ping_json
-  ping_json="$(curl -sk -m 10 "${AUTH_ARGS[@]}" "${API_HOST}/api/controller/v2/ping/" 2>/dev/null)"
+  ping_json="$(curl -sk -m 10 "${AUTH_ARGS[@]}" "${ctrl_api}/api/controller/v2/ping/" 2>/dev/null)"
   if [[ -n "${ping_json}" ]]; then
     if echo "${ping_json}" | grep -qi '"ha"'; then
       detail "Ping payload received"
@@ -1081,10 +1125,10 @@ check_controller() {
   fi
 
   # Metrics endpoint requires auth (expect 401/403 when unauthenticated).
-  probe_api "Controller metrics endpoint" "${API_HOST}/api/controller/v2/metrics/"
+  probe_api "Controller metrics endpoint" "${ctrl_api}/api/controller/v2/metrics/"
 
   # TLS cert on the controller's own NGINX listener.
-  check_cert_expiry localhost 8443 "Controller (8443)"
+  check_cert_expiry "$(node_fqdn)" 8443 "Controller (8443)"
 
   # Instance + capacity health (also the control-plane's mesh view).
   check_controller_instances
@@ -1114,9 +1158,10 @@ check_hub() {
   fi
 
   # The Pulp status endpoint is unauthenticated and reports DB/redis/worker health.
-  probe_api "Hub status API" "${API_HOST}/api/galaxy/pulp/api/v3/status/"
+  local hub_api; hub_api="$(effective_api_host 8444)"
+  probe_api "Hub status API" "${hub_api}/api/galaxy/pulp/api/v3/status/"
   local status_json
-  status_json="$(curl -sk -m 10 "${AUTH_ARGS[@]}" "${API_HOST}/api/galaxy/pulp/api/v3/status/" 2>/dev/null)"
+  status_json="$(curl -sk -m 10 "${AUTH_ARGS[@]}" "${hub_api}/api/galaxy/pulp/api/v3/status/" 2>/dev/null)"
   if [[ -n "${status_json}" ]] && have python3; then
     # Pull database connected + online worker count without assuming jq exists.
     local dbconn workers
@@ -1140,7 +1185,7 @@ except Exception: print("")' 2>/dev/null)"
   local graphroot; graphroot="$(podman info --format '{{.Store.GraphRoot}}' 2>/dev/null)"
   detail "Confirm artifact storage volume has headroom (often a dedicated mount)."
 
-  check_cert_expiry localhost 8444 "Hub (8444)"
+  check_cert_expiry "$(node_fqdn)" 8444 "Hub (8444)"
   check_migrations "${pulp_api:-${pulp_worker}}" "Hub" pulpcore-manager
   check_redis
   check_postgres   # hub DB is typically named 'pulp'
@@ -1193,9 +1238,10 @@ check_eda() {
     [[ -n "${anye}" ]] && info "Found EDA-ish container: ${anye}" || fail "No EDA containers found"
   fi
 
-  probe_api "EDA API" "${API_HOST}/api/eda/v1/"
+  local eda_api; eda_api="$(effective_api_host 8445)"
+  probe_api "EDA API" "${eda_api}/api/eda/v1/"
 
-  check_cert_expiry localhost 8445 "EDA (8445)"
+  check_cert_expiry "$(node_fqdn)" 8445 "EDA (8445)"
   check_migrations "${api:-${worker}}" "EDA" aap-eda-manage eda-manage
   check_redis
   check_postgres
@@ -1204,22 +1250,24 @@ check_eda() {
 # ------------------------------- summary -----------------------------------
 summary() {
   section "Summary"
-  printf '  %sPASS: %d%s   %sWARN: %d%s   %sFAIL: %d%s\n' \
+  printf '%sPASS: %d%s   %sWARN: %d%s   %sFAIL: %d%s\n' \
     "${C_GRN}" "${PASS_COUNT}" "${C_RST}" \
     "${C_YEL}" "${WARN_COUNT}" "${C_RST}" \
     "${C_RED}" "${FAIL_COUNT}" "${C_RST}"
   if [[ "${FAIL_COUNT}" -gt 0 ]]; then
-    printf '\n  %sNode type %s: health check found failures.%s\n' "${C_RED}${C_BOLD}" "${NODETYPE}" "${C_RST}"
+    printf '\n%sNode type %s: health check found failures.%s\n' "${C_RED}${C_BOLD}" "${NODETYPE}" "${C_RST}"
   elif [[ "${WARN_COUNT}" -gt 0 ]]; then
-    printf '\n  %sNode type %s: healthy with warnings.%s\n' "${C_YEL}${C_BOLD}" "${NODETYPE}" "${C_RST}"
+    printf '\n%sNode type %s: healthy with warnings.%s\n' "${C_YEL}${C_BOLD}" "${NODETYPE}" "${C_RST}"
   else
-    printf '\n  %sNode type %s: all checks passed.%s\n' "${C_GRN}${C_BOLD}" "${NODETYPE}" "${C_RST}"
+    printf '\n%sNode type %s: all checks passed.%s\n' "${C_GRN}${C_BOLD}" "${NODETYPE}" "${C_RST}"
   fi
 }
 
 # ------------------------------- main --------------------------------------
-printf '%sAAP 2.6 Containerized Health Check%s\n' "${C_BOLD}" "${C_RST}"
-printf 'Node type: %s   Host: %s   %s\n' "${NODETYPE}" "$(hostname -f 2>/dev/null || hostname)" "$(date '+%Y-%m-%d %H:%M:%S %Z')"
+if [[ "${NO_HEADER}" -eq 0 ]]; then
+  printf '%sAAP 2.6 Containerized Health Check%s\n' "${C_BOLD}" "${C_RST}"
+  printf 'Node type: %s   Host: %s   %s\n' "${NODETYPE}" "$(hostname -f 2>/dev/null || hostname)" "$(date '+%Y-%m-%d %H:%M:%S %Z')"
+fi
 
 check_prerequisites
 preflight
@@ -1243,13 +1291,15 @@ common_checks
 check_ports
 
 case "${NODETYPE}" in
-  gateway)    check_gateway ;;
-  controller) check_controller ;;
-  hub)        check_hub ;;
-  eda)        check_eda ;;
-  execution)  check_execution ;;
-  all)        check_gateway; check_controller; check_eda; check_hub; check_execution ;;
+  automationgateway)        check_gateway ;;
+  automationcontroller)     check_controller ;;
+  automationhub)            check_hub ;;
+  automationeda|automationedacontroller) check_eda ;;
+  execution_nodes)          check_execution ;;
+  aio)        check_gateway; check_controller; check_eda; check_hub; check_execution ;;
 esac
 
-summary
+if [[ "${NO_SUMMARY}" -eq 0 ]]; then
+  summary
+fi
 [[ "${FAIL_COUNT}" -gt 0 ]] && exit 1 || exit 0

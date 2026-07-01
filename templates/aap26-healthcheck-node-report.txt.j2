@@ -1,0 +1,14 @@
+AAP 2.6 Containerized Health Check for {{ aap_host }}
+================================================================================
+SUMMARY:
+
+Host: {{ aap_host }}
+Node type: {{ aap_healthcheck_node_report.nodetype }}
+Date: {{ aap_healthcheck_report_timestamp }} UTC
+Status: {{ 'FAIL' if aap_healthcheck_node_report.failed | bool else 'PASS' }}
+PASS: {{ aap_healthcheck_node_report.pass }}   WARN: {{ aap_healthcheck_node_report.warn }}   FAIL: {{ aap_healthcheck_node_report.fail }}
+================================================================================
+
+FULL REPORT:
+
+{{ aap_healthcheck_node_report.stdout }}
